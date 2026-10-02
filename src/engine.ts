@@ -1,28 +1,51 @@
 import { OrderBook } from './order-book.js';
 import { Account, checkRisk } from './risk.js';
+import { computeBookAnalytics } from './analytics.js';
 import { Analytics, BookOrder, Fill, MarketEvent, Side } from './types.js';
 
 export class MarketEngine {
   readonly books = new Map<string, OrderBook>();
+  /** 按接入（到达）顺序保存，arrivalIndex 标识实际事件顺序；需要时间序视图请用 sortedEvents() */
   readonly events: MarketEvent[] = [];
   readonly fills: Fill[] = [];
   readonly anomalies: Array<Record<string, unknown>> = [];
   readonly accounts = new Map<string, Account>();
   private readonly seenSequences = new Set<string>();
+  private readonly lastBySymbolDay = new Map<string, MarketEvent>();
+  private sortedView: MarketEvent[] | null = null;
+  private arrivalCounter = 0;
 
   constructor() { this.seed(); }
   book(symbol: string): OrderBook { let book = this.books.get(symbol); if (!book) { book = new OrderBook(symbol); this.books.set(symbol, book); } return book; }
+
+  /** 规范化事件顺序：(timestamp, sequence, arrivalIndex)。惰性排序，大批量接入后只排一次 */
+  sortedEvents(): readonly MarketEvent[] {
+    if (!this.sortedView) {
+      this.sortedView = [...this.events].sort((a, b) =>
+        a.timestamp.localeCompare(b.timestamp) || a.sequence - b.sequence || (a.arrivalIndex ?? 0) - (b.arrivalIndex ?? 0));
+    }
+    return this.sortedView;
+  }
+
   ingest(event: MarketEvent): { accepted: boolean; anomaly?: Record<string, unknown> } {
-    const key = `${event.symbol}:${event.sequence}`;
+    // 序列按 (symbol, tradingDay) 编号，跨交易日允许序列重新计数
+    const key = `${event.symbol}:${event.tradingDay}:${event.sequence}`;
     if (this.seenSequences.has(key)) return { accepted: false, anomaly: this.recordAnomaly('duplicate_sequence', event, 'medium') };
-    const previous = this.events.filter(item => item.symbol === event.symbol).at(-1);
+    const previous = this.lastBySymbolDay.get(`${event.symbol}:${event.tradingDay}`);
     if (previous && event.sequence > previous.sequence + 1) this.recordAnomaly('sequence_gap', event, 'high');
     if (previous && event.timestamp < previous.timestamp) this.recordAnomaly('out_of_order_timestamp', event, 'medium');
-    this.seenSequences.add(key); this.events.push(event); this.events.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.sequence - b.sequence); this.book(event.symbol).apply(event);
+    event.arrivalIndex = this.arrivalCounter++;
+    this.seenSequences.add(key);
+    this.events.push(event);
+    this.lastBySymbolDay.set(`${event.symbol}:${event.tradingDay}`, event);
+    this.sortedView = null;
+    this.book(event.symbol).apply(event);
     return { accepted: true };
   }
   analytics(symbol: string): Analytics {
-    const snapshot = this.book(symbol).snapshot(10); const bestBid = snapshot.bids[0]?.price ?? null; const bestAsk = snapshot.asks[0]?.price ?? null; const mid = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : null; const bidDepth = snapshot.bids.reduce((sum, l) => sum + l.quantity, 0); const askDepth = snapshot.asks.reduce((sum, l) => sum + l.quantity, 0); const impact = (side: Side, requested: number) => { const levels = side === 'buy' ? snapshot.asks : snapshot.bids; let left = requested, notional = 0, filled = 0; for (const level of levels) { const take = Math.min(left, level.quantity); notional += take * level.price; filled += take; left -= take; if (!left) break; } const averagePrice = filled ? notional / filled : null; const reference = side === 'buy' ? bestAsk : bestBid; return { quantity: requested, averagePrice: averagePrice ? +averagePrice.toFixed(4) : null, slippageBps: averagePrice && reference ? +(((side === 'buy' ? averagePrice - reference : reference - averagePrice) / reference) * 10_000).toFixed(2) : null, filled: +filled.toFixed(4) }; }; const imbalance = bidDepth + askDepth ? (bidDepth - askDepth) / (bidDepth + askDepth) : 0; const weightedImbalance = snapshot.bids.length && snapshot.asks.length ? (snapshot.bids.slice(0, 5).reduce((s, l) => s + l.quantity, 0) - snapshot.asks.slice(0, 5).reduce((s, l) => s + l.quantity, 0)) / (snapshot.bids.slice(0, 5).reduce((s, l) => s + l.quantity, 0) + snapshot.asks.slice(0, 5).reduce((s, l) => s + l.quantity, 0)) : 0; const spread = bestBid && bestAsk ? bestAsk - bestBid : null; return { symbol, timestamp: snapshot.timestamp, bestBid, bestAsk, midPrice: mid, spread, relativeSpread: mid && spread ? spread / mid : null, bidDepth, askDepth, imbalance: +imbalance.toFixed(4), weightedImbalance: +weightedImbalance.toFixed(4), marketBuyImpact: [100, 500, 1000].map(q => impact('buy', q)), marketSellImpact: [100, 500, 1000].map(q => impact('sell', q)), estimatedFillProbability: { buy: +Math.min(0.98, 0.35 + Math.max(0, weightedImbalance) * .4).toFixed(3), sell: +Math.min(0.98, 0.35 + Math.max(0, -weightedImbalance) * .4).toFixed(3) }, liquidityScore: +Math.max(0, Math.min(100, 100 - (spread ?? 0) * 100 + Math.min(bidDepth + askDepth, 2000) / 40)).toFixed(2) };
+    const snapshot = this.book(symbol).snapshot(10);
+    const { crossed: _crossed, ...metrics } = computeBookAnalytics({ symbol, timestamp: snapshot.timestamp, bids: snapshot.bids, asks: snapshot.asks });
+    return metrics;
   }
   submitOrder(input: { strategyId: string; symbol: string; side: Side; orderType: 'limit' | 'market'; price?: number; quantity: number }): { accepted: boolean; risk: ReturnType<typeof checkRisk>; fills: Fill[]; orderId: string } {
     const analytics = this.analytics(input.symbol); const account = this.account(input.strategyId); const price = input.price ?? (input.side === 'buy' ? analytics.bestAsk ?? 0 : analytics.bestBid ?? 0); const now = Date.now(); const risk = checkRisk({ ...input, price, bestBid: analytics.bestBid, bestAsk: analytics.bestAsk, account, now }); const orderId = `SIM-${this.fills.length + 1}`; if (!risk.allowed) { this.recordAnomaly('risk_rejection', { id: orderId, symbol: input.symbol, timestamp: new Date().toISOString(), sequence: 0 }, 'medium', { strategyId: input.strategyId, rule: risk.rule, code: risk.code }); return { accepted: false, risk, fills: [], orderId }; } account.ordersInWindow.push(now); const order = { id: orderId, side: input.side, price, quantity: input.quantity, remaining: input.quantity, sequence: this.events.length + 1, owner: input.strategyId, type: input.orderType } as BookOrder & { type: 'limit' | 'market' }; const fills = this.book(input.symbol).execute(order, new Date().toISOString()); this.fills.push(...fills); this.applyFills(account, fills); if (order.remaining > 0 && input.orderType === 'market') this.recordAnomaly('unfilled_market_order', { id: orderId, symbol: input.symbol, timestamp: new Date().toISOString(), sequence: 0 }, 'high', { remaining: order.remaining }); return { accepted: true, risk, fills, orderId };

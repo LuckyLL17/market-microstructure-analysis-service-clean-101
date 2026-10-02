@@ -2,23 +2,41 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { MarketEngine } from './engine.js';
 import { OrderBook } from './order-book.js';
-import { MarketEvent } from './types.js';
+import { analyzeWindow, WindowValidationError } from './window.js';
+import { MarketEvent, WindowAnalyticsRequest } from './types.js';
 
-const app = Fastify({ logger: true });
+export const app = Fastify({ logger: true });
 await app.register(cors, { origin: true });
-const engine = new MarketEngine();
+export const engine = new MarketEngine();
 type ReplaySession = { id: string; symbol: string; tradingDay: string; cursor: number; status: string; speed: number; eventCount: number; lastEvent?: MarketEvent; book: OrderBook };
 const replaySessions = new Map<string, ReplaySession>();
+
+const eventsForReplay = (symbol: string, tradingDay: string): MarketEvent[] =>
+  engine.sortedEvents().filter(event => event.symbol === symbol && event.tradingDay === tradingDay);
 
 app.get('/api/health', async () => ({ status: 'ok', service: 'market-microstructure-analysis-service', version: '0.1.0' }));
 app.get('/api/instruments', async () => [{ symbol: 'ALPHA', tradingDay: '2026-09-30', tickSize: .01, lotSize: 1, currency: 'USD', status: 'replay_ready' }]);
 app.post('/api/market-data/events', async request => { const event = request.body as MarketEvent; return engine.ingest(event); });
-app.get('/api/orderbook/:symbol', async request => { const { symbol } = request.params as { symbol: string }; return { symbol, ...engine.book(symbol).snapshot(20), stats: engine.book(symbol).getStats() }; });
+app.get('/api/orderbook/:symbol', async request => { const { symbol } = request.params as { symbol: string }; return { symbol, ...engine.book(symbol).snapshot(20), stats: engine.book(symbol).getStats() } });
 app.get('/api/analytics/:symbol', async request => { const { symbol } = request.params as { symbol: string }; return engine.analytics(symbol); });
-app.post('/api/replay/sessions', async request => { const body = (request.body ?? {}) as { symbol?: string; tradingDay?: string; speed?: number }; const id = `REP-${replaySessions.size + 1}`; const events = engine.events.filter(event => event.symbol === (body.symbol ?? 'ALPHA') && event.tradingDay === (body.tradingDay ?? '2026-09-30')); const session: ReplaySession = { id, symbol: body.symbol ?? 'ALPHA', tradingDay: body.tradingDay ?? '2026-09-30', cursor: 0, status: 'ready', speed: body.speed ?? 1, eventCount: events.length, book: new OrderBook(body.symbol ?? 'ALPHA') }; replaySessions.set(id, session); return { id: session.id, symbol: session.symbol, tradingDay: session.tradingDay, cursor: session.cursor, status: session.status, speed: session.speed, eventCount: session.eventCount, nextEvent: events[0], book: session.book.snapshot(20) }; });
-app.get('/api/replay/sessions/:id', async request => { const session = replaySessions.get((request.params as { id: string }).id); if (!session) return { error: 'session_not_found' }; const events = engine.events.filter(event => event.symbol === session.symbol && event.tradingDay === session.tradingDay); return { id: session.id, symbol: session.symbol, tradingDay: session.tradingDay, cursor: session.cursor, status: session.status, speed: session.speed, eventCount: session.eventCount, progress: session.eventCount ? +(session.cursor / session.eventCount * 100).toFixed(2) : 100, currentEvent: events[session.cursor - 1], nextEvent: events[session.cursor], book: session.book.snapshot(20) }; });
-app.post('/api/replay/sessions/:id/step', async request => { const session = replaySessions.get((request.params as { id: string }).id); if (!session) return { error: 'session_not_found' }; const events = engine.events.filter(event => event.symbol === session.symbol && event.tradingDay === session.tradingDay); const event = events[session.cursor]; if (!event) { session.status = 'completed'; return { ...session, done: true }; } session.cursor += 1; session.book.apply(event); session.lastEvent = event; session.status = session.cursor >= events.length ? 'completed' : 'paused'; return { id: session.id, symbol: session.symbol, cursor: session.cursor, status: session.status, event, done: session.status === 'completed', book: session.book.snapshot(20) }; });
-app.post('/api/replay/sessions/:id/run', async request => { const session = replaySessions.get((request.params as { id: string }).id); if (!session) return { error: 'session_not_found' }; const body = (request.body ?? {}) as { steps?: number }; const events = engine.events.filter(event => event.symbol === session.symbol && event.tradingDay === session.tradingDay); const steps = Math.min(body.steps ?? events.length, events.length - session.cursor); for (const event of events.slice(session.cursor, session.cursor + Math.max(0, steps))) session.book.apply(event); session.cursor += Math.max(0, steps); session.status = session.cursor >= events.length ? 'completed' : 'paused'; session.lastEvent = events[session.cursor - 1]; return { id: session.id, symbol: session.symbol, cursor: session.cursor, status: session.status, processed: steps, done: session.status === 'completed', book: session.book.snapshot(20) }; });
+
+// 事件窗口分析：与当前快照分析并存，按 as-of 重放一段行情
+app.post('/api/analytics/window', async (request, reply) => {
+  try {
+    return analyzeWindow(engine, request.body as WindowAnalyticsRequest);
+  } catch (error) {
+    if (error instanceof WindowValidationError) {
+      return reply.code(400).send({ error: 'window_validation_error', code: error.code, message: error.message });
+    }
+    request.log.error(error);
+    return reply.code(500).send({ error: 'window_analysis_failed' });
+  }
+});
+
+app.post('/api/replay/sessions', async request => { const body = (request.body ?? {}) as { symbol?: string; tradingDay?: string; speed?: number }; const id = `REP-${replaySessions.size + 1}`; const symbol = body.symbol ?? 'ALPHA'; const tradingDay = body.tradingDay ?? '2026-09-30'; const events = eventsForReplay(symbol, tradingDay); const session: ReplaySession = { id, symbol, tradingDay, cursor: 0, status: 'ready', speed: body.speed ?? 1, eventCount: events.length, book: new OrderBook(symbol) }; replaySessions.set(id, session); return { id: session.id, symbol: session.symbol, tradingDay: session.tradingDay, cursor: session.cursor, status: session.status, speed: session.speed, eventCount: session.eventCount, nextEvent: events[0], book: session.book.snapshot(20) }; });
+app.get('/api/replay/sessions/:id', async request => { const session = replaySessions.get((request.params as { id: string }).id); if (!session) return { error: 'session_not_found' }; const events = eventsForReplay(session.symbol, session.tradingDay); return { id: session.id, symbol: session.symbol, tradingDay: session.tradingDay, cursor: session.cursor, status: session.status, speed: session.speed, eventCount: session.eventCount, progress: session.eventCount ? +(session.cursor / session.eventCount * 100).toFixed(2) : 100, currentEvent: events[session.cursor - 1], nextEvent: events[session.cursor], book: session.book.snapshot(20) }; });
+app.post('/api/replay/sessions/:id/step', async request => { const session = replaySessions.get((request.params as { id: string }).id); if (!session) return { error: 'session_not_found' }; const events = eventsForReplay(session.symbol, session.tradingDay); const event = events[session.cursor]; if (!event) { session.status = 'completed'; return { ...session, done: true }; } session.cursor += 1; session.book.apply(event); session.lastEvent = event; session.status = session.cursor >= events.length ? 'completed' : 'paused'; return { id: session.id, symbol: session.symbol, cursor: session.cursor, status: session.status, event, done: session.status === 'completed', book: session.book.snapshot(20) }; });
+app.post('/api/replay/sessions/:id/run', async request => { const session = replaySessions.get((request.params as { id: string }).id); if (!session) return { error: 'session_not_found' }; const body = (request.body ?? {}) as { steps?: number }; const events = eventsForReplay(session.symbol, session.tradingDay); const steps = Math.min(body.steps ?? events.length, events.length - session.cursor); for (const event of events.slice(session.cursor, session.cursor + Math.max(0, steps))) session.book.apply(event); session.cursor += Math.max(0, steps); session.status = session.cursor >= events.length ? 'completed' : 'paused'; session.lastEvent = events[session.cursor - 1]; return { id: session.id, symbol: session.symbol, cursor: session.cursor, status: session.status, processed: steps, done: session.status === 'completed', book: session.book.snapshot(20) }; });
 app.post('/api/sandbox/orders', async request => engine.submitOrder(request.body as { strategyId: string; symbol: string; side: 'buy' | 'sell'; orderType: 'limit' | 'market'; price?: number; quantity: number }));
 app.post('/api/sandbox/cancel', async request => { const body = request.body as { strategyId: string; orderId: string }; return { cancelled: engine.cancel(body.strategyId, body.orderId) }; });
 app.get('/api/sandbox/strategies/:strategyId/performance', async request => engine.performance((request.params as { strategyId: string }).strategyId));
@@ -26,4 +44,7 @@ app.get('/api/sandbox/strategies/:strategyId/events', async request => { const s
 app.get('/api/anomalies', async () => engine.anomalies);
 app.get('/api/metrics', async request => { const { symbol = 'ALPHA' } = request.query as { symbol?: string }; return { analytics: engine.analytics(symbol), eventCount: engine.events.length, fillCount: engine.fills.length, anomalyCount: engine.anomalies.length, bookStats: engine.book(symbol).getStats() }; });
 
-await app.listen({ port: 6190, host: '127.0.0.1' });
+const entry = process.argv[1] ? new URL(`file://${process.argv[1]}`).pathname : '';
+if (entry === new URL(import.meta.url).pathname) {
+  await app.listen({ port: 6190, host: '127.0.0.1' });
+}
