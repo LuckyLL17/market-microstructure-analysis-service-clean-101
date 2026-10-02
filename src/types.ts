@@ -16,6 +16,8 @@ export type MarketEvent = {
   aggressorSide?: Side;
   bids?: PriceLevel[];
   asks?: PriceLevel[];
+  /** 事件到达服务的实际时间（晚到事件判定用）；缺省取接入时刻 */
+  receivedAt?: string;
 };
 
 export type PriceLevel = { price: number; quantity: number };
